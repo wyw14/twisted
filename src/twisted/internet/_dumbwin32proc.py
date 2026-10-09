@@ -129,6 +129,13 @@ class Process(_pollingfile._PollingTimer, BaseProcess):
         _pollingfile._PollingTimer.__init__(self, reactor)
         BaseProcess.__init__(self, protocol)
 
+        # Start with coherent state, so that a failure part-way through
+        # construction leaves a well-defined object.
+        self.pid = None
+        self.hProcess = None
+        self.hThread = None
+        self.closedNotifies = 0
+
         # security attributes for pipes
         sAttrs = win32security.SECURITY_ATTRIBUTES()
         sAttrs.bInheritHandle = 1
@@ -195,38 +202,55 @@ class Process(_pollingfile._PollingTimer, BaseProcess):
             )
 
         try:
-            doCreate()
-        except pywintypes.error as pwte:
-            if not _invalidWin32App(pwte):
-                # This behavior isn't _really_ documented, but let's make it
-                # consistent with the behavior that is documented.
-                raise OSError(pwte)
-            else:
-                # look for a shebang line.  Insert the original 'command'
-                # (actually a script) into the new arguments list.
-                sheb = _findShebang(command)
-                if sheb is None:
-                    raise OSError(
-                        "%r is neither a Windows executable, "
-                        "nor a script with a shebang line" % command
-                    )
+            try:
+                doCreate()
+            except pywintypes.error as pwte:
+                if not _invalidWin32App(pwte):
+                    # This behavior isn't _really_ documented, but let's make it
+                    # consistent with the behavior that is documented.
+                    raise OSError(pwte)
                 else:
-                    args = list(args)
-                    args.insert(0, command)
-                    cmdline = quoteArguments(args)
-                    origcmd = command
-                    command = sheb
-                    try:
-                        # Let's try again.
-                        doCreate()
-                    except pywintypes.error as pwte2:
-                        # d'oh, failed again!
-                        if _invalidWin32App(pwte2):
-                            raise OSError(
-                                "%r has an invalid shebang line: "
-                                "%r is not a valid executable" % (origcmd, sheb)
-                            )
-                        raise OSError(pwte2)
+                    # look for a shebang line.  Insert the original 'command'
+                    # (actually a script) into the new arguments list.
+                    sheb = _findShebang(command)
+                    if sheb is None:
+                        raise OSError(
+                            "%r is neither a Windows executable, "
+                            "nor a script with shebang line" % command
+                        )
+                    else:
+                        args = list(args)
+                        args.insert(0, command)
+                        cmdline = quoteArguments(args)
+                        origcmd = command
+                        command = sheb
+                        try:
+                            # Let's try again.
+                            doCreate()
+                        except pywintypes.error as pwte2:
+                            # d'oh, failed again!
+                            if _invalidWin32App(pwte2):
+                                raise OSError(
+                                    "%r has an invalid shebang line: "
+                                    "%r is not a valid executable"
+                                    % (origcmd, sheb)
+                                )
+                            raise OSError(pwte2)
+        except BaseException:
+            # Startup failed: close every handle acquired above before the
+            # exception propagates, so that a failed start releases the same
+            # process resources as a terminated process and does not affect
+            # later process starts.
+            for handle in (
+                self.hStdoutR,
+                self.hStderrR,
+                self.hStdinW,
+                hStdoutW,
+                hStderrW,
+                hStdinR,
+            ):
+                win32file.CloseHandle(handle)
+            raise
 
         # close handles which only the child will use
         win32file.CloseHandle(hStderrW)
@@ -341,15 +365,18 @@ class Process(_pollingfile._PollingTimer, BaseProcess):
         self.closeStderr()
 
     def outConnectionLost(self):
-        self.proto.childConnectionLost(1)
+        if self.proto is not None:
+            self.proto.childConnectionLost(1)
         self.connectionLostNotify()
 
     def errConnectionLost(self):
-        self.proto.childConnectionLost(2)
+        if self.proto is not None:
+            self.proto.childConnectionLost(2)
         self.connectionLostNotify()
 
     def inConnectionLost(self):
-        self.proto.childConnectionLost(0)
+        if self.proto is not None:
+            self.proto.childConnectionLost(0)
         self.connectionLostNotify()
 
     def connectionLostNotify(self):
@@ -360,12 +387,19 @@ class Process(_pollingfile._PollingTimer, BaseProcess):
         self.maybeCallProcessEnded()
 
     def maybeCallProcessEnded(self):
-        if self.closedNotifies == 3 and self.lostProcess:
-            win32file.CloseHandle(self.hProcess)
-            win32file.CloseHandle(self.hThread)
-            self.hProcess = None
-            self.hThread = None
-            BaseProcess.maybeCallProcessEnded(self)
+        if self.closedNotifies < 3 or not self.lostProcess:
+            # Still waiting for one of the pipe closures or for the process
+            # exit: pipe closures alone cannot report the process as ended.
+            return
+        if self.hProcess is None:
+            # Handles already released and the final notification delivered:
+            # a late notification cannot reopen this process.
+            return
+        win32file.CloseHandle(self.hProcess)
+        win32file.CloseHandle(self.hThread)
+        self.hProcess = None
+        self.hThread = None
+        BaseProcess.maybeCallProcessEnded(self)
 
     # IConsumer
     def registerProducer(self, producer, streaming):

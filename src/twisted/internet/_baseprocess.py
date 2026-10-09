@@ -41,8 +41,17 @@ class BaseProcess:
 
     def processEnded(self, status: int) -> None:
         """
-        This is called when the child terminates.
+        This is called when the child terminates and its exit status is
+        known.
+
+        The termination notification may arrive more than once (for
+        example, from both a SIGCHLD handler and a pipe-close triggered
+        reap), so only the first call establishes the final status.
+        Later calls are ignored and cannot reopen this process.
         """
+        if self.status is not None:
+            # This process has already ended; ignore the late callback.
+            return
         self.status = status
         self.lostProcess += 1
         self.pid = None
@@ -52,6 +61,11 @@ class BaseProcess:
     def maybeCallProcessEnded(self) -> None:
         """
         Call processEnded on protocol after final cleanup.
+
+        Subclasses override this to add their own conditions (for
+        example, all pipes being closed) and chain up to this method.
+        The protocol's L{processEnded} is called at most once: afterwards
+        C{self.proto} is L{None}.
         """
         if self.proto is not None and self.status is not None:
             reason = self._getReason(self.status)

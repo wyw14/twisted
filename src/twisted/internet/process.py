@@ -297,12 +297,17 @@ class _BaseProcess(BaseProcess):
         This is called when sigchild is caught or a Process object loses its
         "connection" (stdout is closed) This ought to result in reaping all
         zombie processes, since it will be called twice as often as it needs
-        to be.
+        to.
 
         (Unfortunately, this is a slightly experimental approach, since
         UNIX has no way to be really sure that your process is going to
         go away w/o blocking.  I don't want to block.)
         """
+        if self.pid is None:
+            # The process has already ended (or was never started). A late
+            # reap notification must do nothing, so that it cannot affect
+            # other processes' state.
+            return
         try:
             try:
                 pid, status = os.waitpid(self.pid, os.WNOHANG)
@@ -481,7 +486,6 @@ class _BaseProcess(BaseProcess):
         # we are now in parent process
         if collectorEnabled:
             gc.enable()
-        self.status = -1  # this records the exit status of the child
 
     def _setupChild(self, *args, **kwargs):
         """
@@ -729,7 +733,6 @@ class Process(_BaseProcess):
     debug = False
     debug_child = False
 
-    status = -1
     pid = None
 
     processWriterFactory = ProcessWriter
@@ -899,7 +902,6 @@ class Process(_BaseProcess):
             ),
             setsigdef=setSigDef,
         )
-        self.status = -1
         return True
 
     if getattr(os, "posix_spawnp", None) is None:
@@ -1083,12 +1085,17 @@ class Process(_BaseProcess):
     def childConnectionLost(self, childFD, reason):
         # this is called when one of the helpers (ProcessReader or
         # ProcessWriter) notices their pipe has been closed
+        if childFD not in self.pipes:
+            # A late or duplicate notification for an already-closed pipe.
+            # The process must stay ended, without errors or callbacks.
+            return
         os.close(self.pipes[childFD].fileno())
         del self.pipes[childFD]
-        try:
-            self.proto.childConnectionLost(childFD)
-        except BaseException:
-            log.err()
+        if self.proto is not None:
+            try:
+                self.proto.childConnectionLost(childFD)
+            except BaseException:
+                log.err()
         self.maybeCallProcessEnded()
 
     def maybeCallProcessEnded(self):
@@ -1119,7 +1126,6 @@ class PTYProcess(abstract.FileDescriptor, _BaseProcess):
     An operating-system Process that uses PTY support.
     """
 
-    status = -1
     pid = None
 
     def __init__(
@@ -1182,7 +1188,6 @@ class PTYProcess(abstract.FileDescriptor, _BaseProcess):
         self.fd = masterfd
         self.startReading()
         self.connected = 1
-        self.status = -1
         try:
             self.proto.makeConnection(self)
         except BaseException:
@@ -1263,21 +1268,32 @@ class PTYProcess(abstract.FileDescriptor, _BaseProcess):
         return self.fd
 
     def maybeCallProcessEnded(self):
-        # two things must happen before we call the ProcessProtocol's
-        # processEnded method. 1: the child process must die and be reaped
-        # (which calls our own processEnded method). 2: the child must close
-        # their stdin/stdout/stderr fds, causing the pty to close, causing
-        # our connectionLost method to be called. #2 can also be triggered
-        # by calling .loseConnection().
-        if self.lostProcess == 2:
-            _BaseProcess.maybeCallProcessEnded(self)
+        # Two independent events must have happened before we call the
+        # ProcessProtocol's processEnded method, in either order:
+        # 1. the child process must have died and been reaped, so the real
+        #    exit status is known (self.status is no longer None); and
+        # 2. the pty must have been closed (self.fd is None), which happens
+        #    when the child closes its stdin/stdout/stderr, or when
+        #    .loseConnection() is called.
+        # A pty closure on its own, before the child is reaped, can never
+        # fabricate a successful exit.
+        if self.status is None or self.fd is not None:
+            return
+        _BaseProcess.maybeCallProcessEnded(self)
 
     def connectionLost(self, reason):
         """
         I call this to clean up when one or all of my connections has died.
         """
+        if self.fd is None:
+            # The pty has already been closed: ignore this late notification
+            # rather than closing the descriptor twice or reopening this
+            # process.
+            return
         abstract.FileDescriptor.connectionLost(self, reason)
-        os.close(self.fd)
+        fd = self.fd
+        self.fd = None
+        os.close(fd)
         self.lostProcess += 1
         self.maybeCallProcessEnded()
 
