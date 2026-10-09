@@ -323,6 +323,80 @@ class CooperatorTests(unittest.TestCase):
         c.stop()
         self.assertFalse(c.running)
 
+    def test_stopNotifiesAllOutstandingTasks(self):
+        """
+        L{Cooperator.stop} notifies every outstanding task exactly once,
+        even though completing a task removes it from the cooperator while
+        the shutdown loop is still running.
+
+        An independent task which is explicitly stopped from within another
+        task's notification keeps its own L{TaskStopped} reason instead of
+        receiving L{SchedulerStopped} as collateral damage.
+        """
+        scheduler = FakeScheduler()
+        cooperator = task.Cooperator(
+            scheduler=scheduler,
+            terminationPredicateFactory=lambda: lambda: True,
+        )
+        tasks = [cooperator.cooperate(iter([1, 2, 3])) for _ in range(6)]
+        failures = [[] for _ in tasks]
+        for eachTask, bucket in zip(tasks, failures):
+            eachTask.whenDone().addErrback(bucket.append)
+
+        def stopLast(reason):
+            reason.trap(task.SchedulerStopped)
+            tasks[-1].stop()
+
+        tasks[0].whenDone().addErrback(stopLast)
+        cooperator.stop()
+
+        # Every waiter was woken, each exactly one time:
+        self.assertEqual([len(bucket) for bucket in failures], [1] * 6)
+        # The first five tasks were stopped by the scheduler...
+        for bucket in failures[:-1]:
+            bucket[0].trap(task.SchedulerStopped)
+        # ...the last one was stopped by its own caller, which wins:
+        failures[-1][0].trap(task.TaskStopped)
+        self.assertIsInstance(
+            tasks[0]._completionState, task.SchedulerStopped
+        )
+        self.assertIsInstance(tasks[-1]._completionState, task.TaskStopped)
+
+    def test_stoppingTaskDoesNotCancelOutstandingDeferred(self):
+        """
+        Stopping a task which is paused on a L{defer.Deferred} does not
+        cancel that Deferred.  It may represent work shared with other,
+        independent consumers, which must still receive its eventual
+        result; only the task itself is cancelled.
+        """
+        scheduler = FakeScheduler()
+        cooperator = task.Cooperator(
+            scheduler=scheduler,
+            terminationPredicateFactory=lambda: lambda: True,
+        )
+        outstanding = defer.Deferred()
+        observed = []
+        outstanding.addCallback(observed.append)
+
+        def myiter():
+            yield outstanding
+
+        cooperativeTask = cooperator.cooperate(myiter())
+        scheduler.pump()
+        self.assertEqual(cooperativeTask._pauseCount, 1)
+
+        failures = []
+        cooperativeTask.whenDone().addErrback(failures.append)
+        cooperativeTask.stop()
+
+        # The outstanding Deferred is untouched by cancelling the task...
+        self.assertFalse(outstanding.called)
+        # ...and still delivers its result to independent consumers:
+        outstanding.callback("still delivered")
+        self.assertEqual(observed, ["still delivered"])
+        self.assertEqual(len(failures), 1)
+        failures[0].trap(task.TaskStopped)
+
 
 class UnhandledException(Exception):
     """
@@ -688,3 +762,126 @@ class RunStateTests(unittest.TestCase):
         self.stopNext()
         self.scheduler.pump()
         self.assertEqual(callbackPhases, [self.task._iterator, "done"])
+
+    def test_stopWhilePausedLateFailureKeepsStopReason(self):
+        """
+        If a task is stopped while paused on a L{defer.Deferred} which only
+        fails afterwards, the caller's cancellation wins: existing waiters
+        are notified exactly once with L{TaskStopped}, the late failure
+        does not replace the terminal reason, and waiters added later still
+        observe L{TaskStopped}.
+        """
+        self.deferNext()
+        self.scheduler.pump()
+        outstanding = self.work.pop()
+
+        failures = []
+        self.task.whenDone().addErrback(failures.append)
+        self.task.stop()
+        self.assertEqual(len(failures), 1)
+        failures[0].trap(task.TaskStopped)
+
+        # The outstanding Deferred now fails; its result was never
+        # delivered to the cancelled task, so this must not complete the
+        # task a second time.
+        outstanding.errback(UnhandledException())
+        self.scheduler.pump()
+
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(self.task._completionState, task.TaskStopped)
+
+        late = []
+        self.task.whenDone().addErrback(late.append)
+        self.assertEqual(len(late), 1)
+        late[0].trap(task.TaskStopped)
+
+    def test_stopWhilePausedLateSuccessDoesNotRestartTask(self):
+        """
+        If a task is stopped while paused on a L{defer.Deferred}, a
+        subsequent successful result from that Deferred does not restart
+        the task or notify its waiters again.
+        """
+        self.deferNext()
+        self.scheduler.pump()
+        outstanding = self.work.pop()
+
+        failures = []
+        self.task.whenDone().addErrback(failures.append)
+        self.task.stop()
+        outstanding.callback(7)
+        self.scheduler.pump()
+
+        self.assertEqual(len(failures), 1)
+        failures[0].trap(task.TaskStopped)
+        self.assertEqual(self.work, [])
+        self.assertIsInstance(self.task._completionState, task.TaskStopped)
+
+    def test_schedulerStopWhilePausedNotifiesWaiters(self):
+        """
+        Stopping the L{Cooperator} while a task is paused on a
+        L{defer.Deferred} notifies its waiters immediately with
+        L{SchedulerStopped}, even if that Deferred is never fired again;
+        a failure arriving afterwards does not notify them a second time.
+        """
+        self.deferNext()
+        self.scheduler.pump()
+        outstanding = self.work.pop()
+
+        failures = []
+        self.task.whenDone().addErrback(failures.append)
+        self.cooperator.stop()
+        self.assertEqual(len(failures), 1)
+        failures[0].trap(task.SchedulerStopped)
+
+        outstanding.errback(UnhandledException())
+        self.scheduler.pump()
+
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(
+            self.task._completionState, task.SchedulerStopped
+        )
+
+    def test_completedResultSurvivesLateCancellation(self):
+        """
+        Once a task has completed, its result can still be read; a later
+        attempt to stop it, or stopping its L{Cooperator}, does not erase
+        the completed result or notify its waiters with a different
+        reason.
+        """
+        self.stopNext()
+        self.scheduler.pump()
+        self.assertIsInstance(self.task._completionState, task.TaskDone)
+
+        results = []
+        self.task.whenDone().addCallback(results.append)
+        self.assertIs(results[0], self.task._iterator)
+
+        self.assertRaises(task.TaskDone, self.task.stop)
+        self.cooperator.stop()
+
+        late = []
+        self.task.whenDone().addCallback(late.append)
+        self.assertIs(late[0], self.task._iterator)
+        self.assertIsInstance(self.task._completionState, task.TaskDone)
+
+    def test_failureReasonSurvivesLateSchedulerStop(self):
+        """
+        A task which terminated because its iterator raised an exception
+        retains that failure as its result even if the L{Cooperator} is
+        stopped later; the shutdown reason does not retroactively replace
+        the task's own failure reason.
+        """
+        self.dieNext()
+        self.scheduler.pump()
+        failures = []
+        self.task.whenDone().addErrback(failures.append)
+        self.assertEqual(len(failures), 1)
+        failures[0].trap(UnhandledException)
+        self.assertIsInstance(self.task._completionState, task.TaskFailed)
+
+        self.cooperator.stop()
+
+        late = []
+        self.task.whenDone().addErrback(late.append)
+        late[0].trap(UnhandledException)
+        self.assertIsInstance(self.task._completionState, task.TaskFailed)

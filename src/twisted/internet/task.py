@@ -398,8 +398,10 @@ class CooperativeTask(Generic[_TaskIteratorT]):
         L{None} if the task is not yet completed, an instance of L{TaskStopped}
         if C{stop} was called to stop this task early, of L{TaskFailed} if the
         application code in the iterator raised an exception which caused it to
-        terminate, and of L{TaskDone} if it terminated normally via raising
-        C{StopIteration}.
+        terminate, of L{TaskDone} if it terminated normally via raising
+        C{StopIteration}, and of L{SchedulerStopped} if its L{Cooperator}
+        was stopped.  Once set, the first terminal state (and its result) is
+        authoritative and is never replaced by a later completion attempt.
     """
 
     def __init__(
@@ -463,7 +465,7 @@ class CooperativeTask(Generic[_TaskIteratorT]):
             raise NotPaused()
         self._pauseCount -= 1
         if self._pauseCount == 0 and self._completionState is None:
-            self._cooperator._addTask(self)
+            self._cooperator._scheduleTask(self)
 
     def _completeWith(
         self,
@@ -477,10 +479,17 @@ class CooperativeTask(Generic[_TaskIteratorT]):
 
         @param deferredResult: the result to fire all the deferreds with.
         """
+        if self._completionState is not None:
+            # The task has already reached a terminal state.  This can happen
+            # when it was stopped (or its cooperator was stopped) while it
+            # was paused waiting on a Deferred, and that Deferred only fires
+            # later.  The first state and result are authoritative: keep the
+            # already-delivered result readable and do not notify waiters a
+            # second time.
+            return
         self._completionState = completionState
         self._completionResult = deferredResult
-        if not self._pauseCount:
-            self._cooperator._removeTask(self)
+        self._cooperator._taskFinished(self)
 
         # The Deferreds need to be invoked after all this is completed, because
         # a Deferred may want to manipulate other tasks in a Cooperator.  For
@@ -589,6 +598,11 @@ class Cooperator:
         L{Cooperator.start} is called.
         """
         self._tasks: list[CooperativeTask[Iterator[object]]] = []
+        # All tasks which have been added but not yet completed, including
+        # paused ones (paused tasks are absent from C{_tasks}, since nothing
+        # needs to be scheduled for them).  This lets the cooperator notify
+        # every outstanding task when it stops.
+        self._allTasks: list[CooperativeTask[Iterator[object]]] = []
         self._metarator: Iterator[CooperativeTask[Iterator[object]]] = iter(())
         self._terminationPredicateFactory = terminationPredicateFactory
         self._scheduler = scheduler
@@ -636,7 +650,17 @@ class Cooperator:
 
     def _addTask(self, task: CooperativeTask[Any]) -> None:
         """
-        Add a L{CooperativeTask} object to this L{Cooperator}.
+        Register a newly created L{CooperativeTask} with this cooperator and
+        schedule it for work.
+        """
+        self._allTasks.append(task)
+        self._scheduleTask(task)
+
+    def _scheduleTask(self, task: CooperativeTask[Any]) -> None:
+        """
+        Add an existing (registered) L{CooperativeTask} to the list of tasks
+        which should perform work.  This is used both for new tasks and when a
+        paused task is resumed.
         """
         if self._stopped:
             self._tasks.append(task)  # XXX silly, I know, but _completeWith
@@ -648,13 +672,25 @@ class Cooperator:
 
     def _removeTask(self, task: CooperativeTask[Any]) -> None:
         """
-        Remove a L{CooperativeTask} from this L{Cooperator}.
+        Remove a L{CooperativeTask} from the list of tasks which are
+        performing work (because it was paused or completed).
         """
         self._tasks.remove(task)
         # If no work left to do, cancel the delayed call:
         if not self._tasks and self._delayedCall:
             self._delayedCall.cancel()
             self._delayedCall = None
+
+    def _taskFinished(self, task: CooperativeTask[Any]) -> None:
+        """
+        Forget about a L{CooperativeTask} which has reached a terminal state.
+
+        Unlike L{_removeTask}, this also drops paused tasks, so every terminal
+        task is forgotten exactly once.
+        """
+        if not task._pauseCount:
+            self._removeTask(task)
+        self._allTasks.remove(task)
 
     def _tasksWhileNotStopped(self) -> Iterable[CooperativeTask[Iterator[object]]]:
         """
@@ -703,9 +739,19 @@ class Cooperator:
         iterators which have been added and forget about them.
         """
         self._stopped = True
-        for taskObj in self._tasks:
-            taskObj._completeWith(SchedulerStopped(), Failure(SchedulerStopped()))
+        # Complete a snapshot: completing each task removes it from the
+        # tracked lists and runs its waiters' callbacks, which may
+        # themselves pause, stop or add tasks.  Iterating the live list
+        # would skip still-outstanding (possibly independent) tasks, and
+        # they would then be dropped without their waiters ever being
+        # notified.
+        outstandingTasks = self._allTasks[:]
+        for taskObj in outstandingTasks:
+            taskObj._completeWith(
+                SchedulerStopped(), Failure(SchedulerStopped())
+            )
         self._tasks = []
+        self._allTasks = []
         if self._delayedCall is not None:
             self._delayedCall.cancel()
             self._delayedCall = None
