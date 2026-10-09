@@ -18,6 +18,7 @@ from twisted.internet._resolver import FirstOneWins
 from twisted.internet.base import DelayedCall, ReactorBase, ThreadedResolver
 from twisted.internet.defer import Deferred
 from twisted.internet.error import DNSLookupError
+from twisted.internet import error
 from twisted.internet.interfaces import IReactorThreads, IReactorTime, IResolverSimple
 from twisted.internet.task import Clock
 from twisted.python.threadpool import ThreadPool
@@ -412,6 +413,331 @@ class DelayedCallDebugTests(DelayedCallMixin, TestCase):
         dc = DelayedCall(3, lambda: None, (), {}, nothing, nothing, lambda: 2)
         dc.debug = 0
         self.assertIn("traceback at creation", repr(dc))
+
+
+class DelayedCallSameTimeOrderingTests(TestCase):
+    """
+    L{DelayedCall} instances scheduled for the same time are ordered by the
+    sequence in which they were registered.
+    """
+
+    def setUp(self):
+        self.first = DelayedCall(
+            1.0, lambda: None, (), {}, nothing, nothing, lambda: 0.0
+        )
+        self.second = DelayedCall(
+            1.0, lambda: None, (), {}, nothing, nothing, lambda: 0.0
+        )
+
+    def test_lt(self):
+        """
+        The earlier registration compares as less than the later one even
+        though both are scheduled for the same time.
+        """
+        self.assertTrue(self.first < self.second)
+        self.assertFalse(self.second < self.first)
+
+    def test_le(self):
+        """
+        The earlier registration compares as less-than-or-equal to the later
+        one; distinct registrations at the same time do not compare equal.
+        """
+        self.assertTrue(self.first <= self.second)
+        self.assertFalse(self.second <= self.first)
+
+
+class _DeterministicTimedCallReactor:
+    """
+    Build just enough of a L{ReactorBase} to deterministically drive its
+    timed-call machinery (L{ReactorBase.callLater},
+    L{ReactorBase.runUntilCurrent} and friends) without a real event loop.
+    """
+
+    def __init__(self):
+        reactor = ReactorBase.__new__(ReactorBase)
+        reactor._pendingTimedCalls = []
+        reactor._newTimedCalls = []
+        reactor._cancellations = 0
+        reactor.threadCallQueue = []
+        reactor._justStopped = False
+        reactor._stopped = False
+        reactor._eventTriggers = {}
+        self._now = 0.0
+        reactor.seconds = self.seconds
+        self.reactor = reactor
+
+    def seconds(self):
+        return self._now
+
+    def callLater(self, delay, f, *args, **kwargs):
+        return self.reactor.callLater(delay, f, *args, **kwargs)
+
+    def getDelayedCalls(self):
+        return self.reactor.getDelayedCalls()
+
+    def advance(self, now):
+        """
+        Move the clock to C{now} and run one reactor batch.
+        """
+        self._now = now
+        self.reactor._insertNewDelayedCalls()
+        self.reactor.runUntilCurrent()
+        return self
+
+
+class TimedCallBatchTests(TestCase):
+    """
+    Deterministic tests for the dispatch of multiple timed calls which
+    become due at the same moment, including cancellation, rescheduling,
+    clock jumps, errors and shutdown.
+    """
+
+    def test_sameTimeCallsRunInRegistrationOrder(self):
+        """
+        Many calls scheduled for the same moment are dispatched in their
+        registration order.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        count = 12
+        for i in range(count):
+            harness.callLater(10.0, events.append, i)
+        harness.advance(10.0)
+        self.assertEqual(events, list(range(count)))
+
+    def test_cancelledCallsDoNotRunAndDoNotReorderTheRest(self):
+        """
+        Cancelling some of the calls due at the same moment keeps the
+        relative order of the remaining calls; cancelled calls are not part
+        of the reported pending set and never run.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        calls = [harness.callLater(10.0, events.append, i) for i in range(12)]
+        harness.reactor._insertNewDelayedCalls()
+        calls[3].cancel()
+        calls[6].cancel()
+        harness.advance(10.0)
+        self.assertEqual(events, [i for i in range(12) if i not in (3, 6)])
+        self.assertEqual(harness.getDelayedCalls(), [])
+
+    def test_resetLaterFromDueCallbackRunsOnceAtNewTime(self):
+        """
+        A due call which is reset to a later moment from within another due
+        callback runs exactly once, at the new time, while the other due
+        calls keep their registration order.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        holder = {}
+
+        def reschedule():
+            events.append("a")
+            holder["b"].reset(5.0)
+
+        harness.callLater(10.0, reschedule)
+        holder["b"] = harness.callLater(10.0, events.append, "b")
+        harness.callLater(10.0, events.append, "c")
+        harness.callLater(10.0, events.append, "d")
+        harness.advance(10.0)
+        self.assertEqual(events, ["a", "c", "d"])
+        harness.advance(15.0)
+        self.assertEqual(events, ["a", "c", "d", "b"])
+
+    def test_cancelFromDueCallback(self):
+        """
+        A due call cancelled from within another due callback does not run;
+        the rest of the batch is unaffected.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        holder = {}
+
+        def cancel():
+            events.append("a")
+            holder["b"].cancel()
+
+        harness.callLater(10.0, cancel)
+        holder["b"] = harness.callLater(10.0, events.append, "b")
+        harness.callLater(10.0, events.append, "c")
+        harness.advance(10.0)
+        self.assertEqual(events, ["a", "c"])
+        self.assertEqual(harness.getDelayedCalls(), [])
+
+    def test_resetSoonerRunsOnceAtNewTime(self):
+        """
+        A call reset to an earlier time runs exactly once at the new time
+        and never runs at the originally scheduled time.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        call = harness.callLater(20.0, events.append, "x")
+        harness.reactor._insertNewDelayedCalls()
+        harness.advance(5.0)
+        call.reset(5.0)  # 5 seconds after the 5.0 reading -> time 10
+        harness.advance(9.0)
+        self.assertEqual(events, [])
+        harness.advance(10.0)
+        self.assertEqual(events, ["x"])
+        harness.advance(20.0)
+        self.assertEqual(events, ["x"])
+
+    def test_clockJumpForwardRunsDueBatchOnly(self):
+        """
+        A forward jump which makes many calls due at once dispatches them
+        once each in registration order, without running calls that are
+        still in the future.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        for i in range(12):
+            harness.callLater(10.0, events.append, i)
+        for i in range(12, 20):
+            harness.callLater(100.0, events.append, i)
+        harness.advance(55.0)
+        self.assertEqual(events, list(range(12)))
+        harness.advance(100.0)
+        self.assertEqual(events, list(range(20)))
+
+    def test_clockJumpBackwardDoesNotRunOrRepeat(self):
+        """
+        A backward jump must not execute pending calls (nor repeat executed
+        ones), and a reset afterwards is relative to the jumped-back clock.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        call = harness.callLater(100.0, events.append, "x")
+        harness.reactor._insertNewDelayedCalls()
+        harness._now = 120.0
+        harness._now = 50.0
+        harness.reactor.runUntilCurrent()
+        self.assertEqual(events, [])
+        call.reset(10.0)  # 50 + 10 -> time 60
+        harness.advance(60.0)
+        self.assertEqual(events, ["x"])
+        harness.advance(120.0)
+        self.assertEqual(events, ["x"])
+
+    def test_exceptionInOneDueCallbackIsolatesTheOthers(self):
+        """
+        When a due callback raises, the other due callbacks still run once
+        each and the failure is reported through logging.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+
+        def boom():
+            events.append("boom")
+            raise RuntimeError("boom")
+
+        harness.callLater(10.0, events.append, "a")
+        harness.callLater(10.0, boom)
+        harness.callLater(10.0, events.append, "c")
+        harness.advance(10.0)
+        self.assertEqual(events, ["a", "boom", "c"])
+        failures = self.flushLoggedErrors(RuntimeError)
+        self.assertEqual(len(failures), 1)
+
+    def test_stopDuringBatchPurgesDueCallsAndFiresShutdownOnce(self):
+        """
+        When the reactor is stopped while a due batch is running, the due
+        calls each run once; zero-delay calls registered during the batch
+        (which would only be inserted on the next, now-never iteration) are
+        discarded rather than left pending; future calls stay pending; the
+        shutdown event fires once.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        shutdowns = []
+        zeroDelayHolder = {}
+
+        class _Shutdown:
+            def fireEvent(self):
+                shutdowns.append("shutdown")
+
+        harness.reactor._eventTriggers["shutdown"] = _Shutdown()
+
+        def stop():
+            events.append("stop")
+            harness.reactor.stop()
+
+        for i in range(6):
+            harness.callLater(10.0, events.append, f"before{i}")
+        harness.callLater(10.0, stop)
+        for i in range(6):
+            harness.callLater(10.0, events.append, f"after{i}")
+        future = harness.callLater(50.0, events.append, "future")
+
+        def registerZeroDelay():
+            events.append("register")
+            zeroDelayHolder["call"] = harness.callLater(
+                0.0, events.append, "never"
+            )
+
+        harness.callLater(10.0, registerZeroDelay)
+        harness.advance(10.0)
+        # The whole due batch ran once; the zero-delay call did not.
+        self.assertEqual(
+            events,
+            [f"before{i}" for i in range(6)]
+            + ["stop"]
+            + [f"after{i}" for i in range(6)]
+            + ["register"],
+        )
+        # Simulate mainLoop's timeout() insertion attempt after shutdown.
+        harness.reactor.timeout()
+        pending = harness.getDelayedCalls()
+        self.assertEqual([c for c in pending if c.getTime() <= 10.0], [])
+        self.assertIn(future, pending)
+        self.assertEqual(shutdowns, ["shutdown"])
+        # The due-but-never-dispatched call is gone and reports inactive,
+        # with the same exception semantics as a cancellation.
+        discarded = zeroDelayHolder["call"]
+        self.assertNotIn(discarded, pending)
+        self.assertFalse(discarded.active())
+        self.assertRaises(error.AlreadyCancelled, discarded.cancel)
+
+    def test_oneShotAndZeroDelayRunOnceAndReportActivity(self):
+        """
+        Ordinary one-shot calls (including zero-delay ones) run exactly
+        once, report active beforehand/inactive afterwards, and keep their
+        scheduled time.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        delayed = harness.callLater(3.0, events.append, "late")
+        zero = harness.callLater(0.0, events.append, "now")
+        self.assertTrue(delayed.active())
+        self.assertTrue(zero.active())
+        self.assertEqual(delayed.getTime(), 3.0)
+        harness.advance(0.0)
+        self.assertEqual(events, ["now"])
+        self.assertFalse(zero.active())
+        self.assertTrue(delayed.active())
+        harness.advance(3.0)
+        self.assertEqual(events, ["now", "late"])
+        self.assertFalse(delayed.active())
+        harness.advance(100.0)
+        self.assertEqual(events, ["now", "late"])
+
+    def test_repeatCancelOrResetKeepsExceptionSemantics(self):
+        """
+        Cancelling or resetting an already-called or already-cancelled call
+        raises the established exceptions and never causes a repeat run.
+        """
+        harness = _DeterministicTimedCallReactor()
+        events = []
+        called = harness.callLater(10.0, events.append, "a")
+        cancelled = harness.callLater(10.0, events.append, "b")
+        cancelled.cancel()
+        harness.advance(10.0)
+        self.assertEqual(events, ["a"])
+        self.assertRaises(error.AlreadyCalled, called.cancel)
+        self.assertRaises(error.AlreadyCalled, called.reset, 1.0)
+        self.assertRaises(error.AlreadyCancelled, cancelled.cancel)
+        self.assertRaises(error.AlreadyCancelled, cancelled.reset, 1.0)
+        harness.advance(100.0)
+        self.assertEqual(events, ["a"])
 
 
 class TestSpySignalCapturingReactor(ReactorBase):

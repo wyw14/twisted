@@ -781,8 +781,12 @@ class Clock:
     def _sortCalls(self) -> None:
         """
         Sort the pending calls according to the time they are scheduled.
+
+        Calls scheduled for the same time keep their registration order:
+        L{DelayedCall.getTime} is the primary key and the call's registration
+        sequence is the tiebreaker.
         """
-        self.calls.sort(key=lambda a: a.getTime())
+        self.calls.sort(key=lambda a: (a.getTime(), a.seq))
 
     def callLater(
         self, delay: float, callable: Callable[..., object], *args: object, **kw: object
@@ -814,16 +818,32 @@ class Clock:
         Move time on this clock forward by the given amount and run whatever
         pending calls should be run.
 
+        Each due call is invoked in scheduled order.  If one of these calls
+        raises an exception, the remaining due calls are still invoked once,
+        so that the whole due batch converges the same way it does on a real
+        reactor; the first exception is then reported to the caller.
+
         @param amount: The number of seconds which to advance this clock's
         time.
         """
         self.rightNow += amount
         self._sortCalls()
+        error: BaseException | None = None
         while self.calls and self.calls[0].getTime() <= self.seconds():
             call = self.calls.pop(0)
             call.called = 1
-            call.func(*call.args, **call.kw)
+            try:
+                call.func(*call.args, **call.kw)
+            except BaseException as e:
+                # Remember the first failure and keep going so that every due
+                # call converges exactly once, mirroring the per-call error
+                # isolation provided by a running reactor.  Re-raise it once
+                # the whole due batch has been dispatched.
+                if error is None:
+                    error = e
             self._sortCalls()
+        if error is not None:
+            raise error
 
     def pump(self, timings: Iterable[float]) -> None:
         """

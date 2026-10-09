@@ -236,6 +236,59 @@ class ClockTests(unittest.TestCase):
         clock.pump([0.5] * 10)
         self.assertEqual(result, expected)
 
+    def test_callLaterSameTimeKeepsRegistrationOrder(self):
+        """
+        Many calls scheduled for the exact same time are invoked once each,
+        in the order they were registered.
+        """
+        result = []
+        clock = task.Clock()
+        count = 12
+        for i in range(count):
+            clock.callLater(1.0, result.append, i)
+        clock.advance(1.0)
+        self.assertEqual(result, list(range(count)))
+
+    def test_callLaterSameTimeCancelledKeepsOrder(self):
+        """
+        Cancelling some of the calls due at the same time leaves the
+        registration order of the remaining calls intact.
+        """
+        result = []
+        clock = task.Clock()
+        calls = [clock.callLater(1.0, result.append, i) for i in range(8)]
+        calls[2].cancel()
+        calls[5].cancel()
+        clock.advance(1.0)
+        self.assertEqual(result, [0, 1, 3, 4, 6, 7])
+        self.assertEqual(clock.getDelayedCalls(), [])
+
+    def test_advanceErrorRunsRestOfBatchAndReraises(self):
+        """
+        If one due callback raises, every other call due at the same time is
+        still invoked once in order; the first exception is then reported to
+        the caller of L{task.Clock.advance}, mirroring the per-call error
+        isolation of a real event loop.
+        """
+
+        class ExpectedError(Exception):
+            pass
+
+        result = []
+        clock = task.Clock()
+
+        def boom():
+            result.append("boom")
+            raise ExpectedError()
+
+        clock.callLater(1.0, result.append, "a")
+        clock.callLater(1.0, boom)
+        clock.callLater(1.0, result.append, "c")
+        self.assertRaises(ExpectedError, clock.advance, 1.0)
+        self.assertEqual(result, ["a", "boom", "c"])
+        # Nothing due is left behind to run again.
+        self.assertEqual(clock.getDelayedCalls(), [])
+
 
 class LoopTests(unittest.TestCase):
     """

@@ -9,6 +9,7 @@ Very basic functionality for a Reactor implementation.
 from __future__ import annotations
 
 import builtins
+import itertools
 import socket  # needed only for sync-dns
 import warnings
 from abc import ABC, abstractmethod
@@ -72,6 +73,11 @@ _topHandler = _log.failureHandler("Unexpected error in main loop")
 _threadCallHandler = _log.failureHandler("while calling from thread")
 _systemEventHandler = _log.failureHandler("While calling system event trigger handler")
 
+# Monotonic sequence used to break ties between L{DelayedCall} instances
+# scheduled for the same time, so that calls which become due at the same
+# moment are dispatched in the order they were registered.
+_delayedCallSerial = itertools.count()
+
 
 @implementer(IDelayedCall)
 class DelayedCall:
@@ -115,6 +121,9 @@ class DelayedCall:
         self.seconds = seconds
         self.cancelled = self.called = 0
         self.delayed_time = 0.0
+        # Registration order of this call; used as a tiebreaker so that calls
+        # scheduled for the same time are dispatched in registration order.
+        self.seq = next(_delayedCallSerial)
         if self.debug:
             self.creator = format_stack()[:-2]
 
@@ -207,18 +216,20 @@ class DelayedCall:
         Implement C{<=} operator between two L{DelayedCall} instances.
 
         Comparison is based on the C{time} attribute (unadjusted by the
-        delayed time).
+        delayed time); calls scheduled for the same time are ordered by their
+        registration sequence (earlier registrations come first).
         """
-        return self.time <= other.time
+        return (self.time, self.seq) <= (other.time, other.seq)
 
     def __lt__(self, other: DelayedCall) -> bool:
         """
         Implement C{<} operator between two L{DelayedCall} instances.
 
         Comparison is based on the C{time} attribute (unadjusted by the
-        delayed time).
+        delayed time); calls scheduled for the same time are ordered by their
+        registration sequence (earlier registrations come first).
         """
-        return self.time < other.time
+        return (self.time, self.seq) < (other.time, other.seq)
 
     def __repr__(self) -> str:
         """
@@ -1104,6 +1115,29 @@ class ReactorBase(PluggableResolverMixin):
             heapify(self._pendingTimedCalls)
 
         if self._justStopped:
+            # The reactor was asked to stop (possibly from one of the calls
+            # just dispatched).  There will be no further iteration, so insert
+            # any calls registered during this batch and discard the ones
+            # which are already due but never going to run: they must not be
+            # left in the set of pending calls reported to callers.  Calls
+            # scheduled for later are kept pending.
+            self._insertNewDelayedCalls()
+            stopNow = self.seconds()
+            while self._pendingTimedCalls and (
+                self._pendingTimedCalls[0].time <= stopNow
+            ):
+                call = heappop(self._pendingTimedCalls)
+                if call.cancelled:
+                    self._cancellations -= 1
+                    continue
+                if call.delayed_time > 0.0:
+                    # A call pushed to a later time; only discard it if its
+                    # adjusted time is also already due.
+                    call.activate_delay()
+                    heappush(self._pendingTimedCalls, call)
+                    continue
+                call.cancelled = 1
+
             self._justStopped = False
             self.fireSystemEvent("shutdown")
 
