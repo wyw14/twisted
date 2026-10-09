@@ -7,6 +7,7 @@ Test cases for Twisted component architecture.
 """
 
 
+import threading
 from functools import wraps
 
 from zope.interface import Attribute, Interface, implementer
@@ -395,22 +396,50 @@ class RegistrationTests(RegistryUsingMixin, unittest.SynchronousTestCase):
 
     def _duplicateAdapterForClassOrInterface(self, original):
         """
-        Verify that L{components.registerAdapter} raises L{ValueError} if the
-        from-type/interface and to-interface pair is not unique.
+        Duplicate registrations for the same from-type/interface and
+        to-interface pair follow a stable priority: the first registered
+        adapter is always returned by lookups while the second registration
+        is kept as a lower-priority alternative.
         """
         firstAdapter = lambda o: False
         secondAdapter = lambda o: True
         components.registerAdapter(firstAdapter, original, ITest)
-        self.assertRaises(
-            ValueError, components.registerAdapter, secondAdapter, original, ITest
+        # Registering a second adapter neither raises nor replaces.
+        components.registerAdapter(secondAdapter, original, ITest)
+        self.assertIs(
+            components.getAdapterFactory(original, ITest, None), firstAdapter
         )
-        # Make sure that the original adapter is still around as well
-        self.assertIs(components.getAdapterFactory(original, ITest, None), firstAdapter)
+
+        # Re-registering the same adapter is an idempotent no-op (e.g. a
+        # module is imported or executed more than once).
+        components.registerAdapter(firstAdapter, original, ITest)
+        self.assertIs(
+            components.getAdapterFactory(original, ITest, None), firstAdapter
+        )
+
+        # Removing the current adapter promotes the next one ...
+        self.assertTrue(
+            components.unregisterAdapter(firstAdapter, original, ITest)
+        )
+        self.assertIs(
+            components.getAdapterFactory(original, ITest, None), secondAdapter
+        )
+        # ... and removing the last adapter makes new lookups miss.
+        self.assertTrue(
+            components.unregisterAdapter(secondAdapter, original, ITest)
+        )
+        self.assertIsNone(components.getAdapterFactory(original, ITest, None))
+        # Removing something which is not registered reports False and does
+        # not bring the old entry back.
+        self.assertFalse(
+            components.unregisterAdapter(secondAdapter, original, ITest)
+        )
+        self.assertIsNone(components.getAdapterFactory(original, ITest, None))
 
     def test_duplicateAdapterForClass(self):
         """
-        Test that attempting to register a second adapter from a class
-        raises the appropriate exception.
+        A second adapter registered from a class becomes a lower-priority
+        alternative to the first registration instead of raising.
         """
 
         class TheOriginal:
@@ -420,16 +449,19 @@ class RegistrationTests(RegistryUsingMixin, unittest.SynchronousTestCase):
 
     def test_duplicateAdapterForInterface(self):
         """
-        Test that attempting to register a second adapter from an interface
-        raises the appropriate exception.
+        A second adapter registered from an interface becomes a
+        lower-priority alternative to the first registration instead of
+        raising.
         """
         return self._duplicateAdapterForClassOrInterface(ITest2)
 
     def _duplicateAdapterForClassOrInterfaceAllowed(self, original):
         """
-        Verify that when C{components.ALLOW_DUPLICATES} is set to C{True}, new
-        adapter registrations for a particular from-type/interface and
-        to-interface pair replace older registrations.
+        Verify that when C{components.ALLOW_DUPLICATES} is set to C{True}, a
+        new adapter registration for a particular from-type/interface and
+        to-interface pair replaces the current registration.  Once the flag
+        is false again, new registrations become lower-priority alternatives
+        rather than replacements.
         """
         firstAdapter = lambda o: False
         secondAdapter = lambda o: True
@@ -448,20 +480,32 @@ class RegistrationTests(RegistryUsingMixin, unittest.SynchronousTestCase):
         finally:
             components.ALLOW_DUPLICATES = False
 
-        # It should be rejected again at this point
-        self.assertRaises(
-            ValueError, components.registerAdapter, firstAdapter, original, TheInterface
-        )
-
+        # Strict behavior is back: re-adding the old adapter does not
+        # replace the current one, it only becomes a lower-priority option.
+        components.registerAdapter(firstAdapter, original, TheInterface)
         self.assertIs(
-            components.getAdapterFactory(original, TheInterface, None), secondAdapter
+            components.getAdapterFactory(original, TheInterface, None),
+            secondAdapter,
+        )
+        # Removing the current adapter promotes the alternative ...
+        components.unregisterAdapter(secondAdapter, original, TheInterface)
+        self.assertIs(
+            components.getAdapterFactory(original, TheInterface, None),
+            firstAdapter,
+        )
+        # ... and removing everything at once makes later lookups miss.
+        self.assertTrue(
+            components.unregisterAdapter(None, original, TheInterface)
+        )
+        self.assertIsNone(
+            components.getAdapterFactory(original, TheInterface, None)
         )
 
     def test_duplicateAdapterForClassAllowed(self):
         """
         Test that when L{components.ALLOW_DUPLICATES} is set to a true
-        value, duplicate registrations from classes are allowed to override
-        the original registration.
+        value, duplicate registrations from classes override the original
+        registration.
         """
 
         class TheOriginal:
@@ -472,14 +516,177 @@ class RegistrationTests(RegistryUsingMixin, unittest.SynchronousTestCase):
     def test_duplicateAdapterForInterfaceAllowed(self):
         """
         Test that when L{components.ALLOW_DUPLICATES} is set to a true
-        value, duplicate registrations from interfaces are allowed to
-        override the original registration.
+        value, duplicate registrations from interfaces override the
+        original registration.
         """
 
         class TheOriginal(Interface):
             pass
 
         return self._duplicateAdapterForClassOrInterfaceAllowed(TheOriginal)
+
+    def _unregisterLowerPriorityAdapterForClassOrInterface(self, original):
+        """
+        Removing a lower-priority adapter leaves the current lookup result
+        untouched; the removed adapter is skipped when promotion happens.
+        """
+        firstAdapter = lambda o: 1
+        secondAdapter = lambda o: 2
+        thirdAdapter = lambda o: 3
+        components.registerAdapter(firstAdapter, original, ITest)
+        components.registerAdapter(secondAdapter, original, ITest)
+        components.registerAdapter(thirdAdapter, original, ITest)
+
+        self.assertTrue(
+            components.unregisterAdapter(secondAdapter, original, ITest)
+        )
+        self.assertIs(
+            components.getAdapterFactory(original, ITest, None), firstAdapter
+        )
+
+        components.unregisterAdapter(firstAdapter, original, ITest)
+        # secondAdapter is gone, so thirdAdapter (not secondAdapter) is
+        # promoted.
+        self.assertIs(
+            components.getAdapterFactory(original, ITest, None), thirdAdapter
+        )
+
+    def test_unregisterLowerPriorityAdapterForClass(self):
+        """
+        A lower-priority adapter registered from a class can be removed
+        without disturbing the current lookup result.
+        """
+
+        class TheOriginal:
+            pass
+
+        return self._unregisterLowerPriorityAdapterForClassOrInterface(
+            TheOriginal
+        )
+
+    def test_unregisterLowerPriorityAdapterForInterface(self):
+        """
+        A lower-priority adapter registered from an interface can be
+        removed without disturbing the current lookup result.
+        """
+        return self._unregisterLowerPriorityAdapterForClassOrInterface(ITest2)
+
+    def test_unregisterAllIgnoresMissing(self):
+        """
+        Removing every adapter for an unregistered pair reports False and
+        raises nothing.
+        """
+        self.assertFalse(
+            components.unregisterAdapter(None, ITest2, ITest)
+        )
+
+    def test_lookupDefaultOnMiss(self):
+        """
+        Lookups which fail to match return the supplied default explicitly
+        (never a removed factory); with C{None}, the result is C{None}.
+        """
+        adapter = lambda o: None
+        sentinel = object()
+        components.registerAdapter(adapter, ITest2, ITest)
+        components.unregisterAdapter(adapter, ITest2, ITest)
+        self.assertIs(
+            components.getAdapterFactory(ITest2, ITest, sentinel), sentinel
+        )
+        self.assertIsNone(components.getAdapterFactory(ITest2, ITest, None))
+        # A pair which was never registered at all.
+        self.assertIs(
+            components.getAdapterFactory(ITest3, ITest4, sentinel), sentinel
+        )
+
+    def test_replacementKeepsRetrievedReference(self):
+        """
+        Adapter factories retrieved before a replacement keep working: only
+        new lookups observe the replacement.
+        """
+        oldAdapter = lambda o: "old"
+        newAdapter = lambda o: "new"
+        components.registerAdapter(oldAdapter, ITest2, ITest)
+        retrieved = components.getAdapterFactory(ITest2, ITest, None)
+
+        components.ALLOW_DUPLICATES = True
+        try:
+            components.registerAdapter(newAdapter, ITest2, ITest)
+        finally:
+            components.ALLOW_DUPLICATES = False
+
+        self.assertIs(retrieved, oldAdapter)
+        self.assertIs(
+            components.getAdapterFactory(ITest2, ITest, None), newAdapter
+        )
+
+    def test_concurrentRegistrationAndQuery(self):
+        """
+        Concurrent registrations and queries do not corrupt the stable
+        priority: the adapter first registered remains the lookup result
+        until explicitly removed; after that the other registrations are
+        promoted in order, and removing all of them makes lookups miss.
+        """
+        firstAdapter = lambda o: "first"
+        otherAdapters = [
+            (lambda o, n=i: n) for i in range(20)
+        ]
+        errors = []
+
+        # The first registration establishes the stable top entry.
+        components.registerAdapter(firstAdapter, ITest2, ITest)
+
+        def register(adapter):
+            try:
+                components.registerAdapter(adapter, ITest2, ITest)
+            except BaseException as e:  # pragma: no cover
+                errors.append(e)
+
+        def query():
+            try:
+                for _ in range(1000):
+                    factory = components.getAdapterFactory(
+                        ITest2, ITest, None
+                    )
+                    if factory is not firstAdapter:
+                        errors.append(
+                            AssertionError(
+                                "stable top entry changed to "
+                                f"{factory!r}"
+                            )
+                        )
+            except BaseException as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=register, args=(adapter,))
+            for adapter in otherAdapters
+        ]
+        threads += [threading.Thread(target=query) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+
+        # All 21 registrations are present exactly once.  Removing the top
+        # entry one at a time promotes the next priority, in registration
+        # order, until lookups miss.
+        seen = []
+        while True:
+            factory = components.getAdapterFactory(ITest2, ITest, None)
+            if factory is None:
+                break
+            seen.append(factory)
+            self.assertTrue(
+                components.unregisterAdapter(factory, ITest2, ITest)
+            )
+        self.assertEqual(len(seen), 21)
+        self.assertEqual(len(set(seen)), 21)
+        self.assertIs(seen[0], firstAdapter)
+        self.assertEqual(
+            set(seen), {firstAdapter, *otherAdapters}
+        )
+        self.assertIsNone(components.getAdapterFactory(ITest2, ITest, None))
 
     def _multipleInterfacesForClassOrInterface(self, original):
         """

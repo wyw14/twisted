@@ -30,6 +30,7 @@ interface.
 """
 
 
+import threading
 from io import StringIO
 
 # zope3 imports
@@ -43,7 +44,31 @@ from twisted.python import reflect
 globalRegistry = AdapterRegistry()
 
 # Attribute that registerAdapter looks at. Is this supposed to be public?
+# When this is false (the default), duplicate registrations are kept as
+# lower-priority alternatives instead of replacing the first registration;
+# when it is true, a new registration explicitly replaces the previous one.
 ALLOW_DUPLICATES = 0
+
+
+def _adapterPriorityState(registry):
+    """
+    Return the stable-priority bookkeeping for the given registry, creating
+    it if necessary.
+
+    The returned C{chains} mapping maps an
+    C{(origInterface, interfaceClass)} key to a list of adapter factories in
+    priority order (highest priority first).  The first element of the list
+    is always the factory actually registered in the underlying registry and
+    therefore the one returned by its lookups.  All access to C{chains} must
+    be serialized with the returned reentrant lock.
+    """
+    chains = getattr(registry, "_twistedAdapterChains", None)
+    lock = getattr(registry, "_twistedAdapterLock", None)
+    if chains is None or lock is None:
+        chains, lock = {}, threading.RLock()
+        registry._twistedAdapterChains = chains
+        registry._twistedAdapterLock = lock
+    return chains, lock
 
 
 def registerAdapter(adapterFactory, origInterface, *interfaceClasses):
@@ -53,6 +78,18 @@ def registerAdapter(adapterFactory, origInterface, *interfaceClasses):
     adapting instances implementing 'origInterface'. An adapter class's
     __init__ method should accept one parameter, an instance implementing
     'origInterface'.
+
+    The same origInterface/interfaceClass pair may be registered more than
+    once, including by different modules.  Such registrations form a stable
+    priority order: the adapter registered first is always returned by
+    lookups, while later registrations are kept as lower-priority
+    alternatives.  Registering an adapter which is already registered is a
+    no-op, so importing a module more than once changes nothing.
+
+    When the module-level L{ALLOW_DUPLICATES} flag is true, a new
+    registration instead replaces the previous one: subsequent lookups
+    return the new adapter factory.  Adapter factories which were retrieved
+    before such a replacement (or before any other change) are not affected.
     """
     self = globalRegistry
     assert interfaceClasses, "You need to pass an Interface"
@@ -61,12 +98,86 @@ def registerAdapter(adapterFactory, origInterface, *interfaceClasses):
     if not isinstance(origInterface, interface.InterfaceClass):
         origInterface = declarations.implementedBy(origInterface)
 
+    chains, lock = _adapterPriorityState(self)
     for interfaceClass in interfaceClasses:
-        factory = self.registered([origInterface], interfaceClass)
-        if factory is not None and not ALLOW_DUPLICATES:
-            raise ValueError(f"an adapter ({factory}) was already registered.")
+        key = (origInterface, interfaceClass)
+        with lock:
+            chain = chains.get(key)
+            if chain is None:
+                self.register([origInterface], interfaceClass, "", adapterFactory)
+                chains[key] = [adapterFactory]
+                continue
+
+            if adapterFactory in chain:
+                # Re-registration of the same factory: idempotent no-op.
+                continue
+
+            if ALLOW_DUPLICATES:
+                # Explicit replacement: the new factory takes the top slot.
+                self.register([origInterface], interfaceClass, "", adapterFactory)
+                chains[key] = [
+                    adapterFactory,
+                    *[
+                        factory
+                        for factory in chain
+                        if factory is not adapterFactory
+                    ],
+                ]
+            else:
+                # Stable priority: earlier registrations keep precedence.
+                chain.append(adapterFactory)
+
+
+def unregisterAdapter(adapterFactory, origInterface, *interfaceClasses):
+    """Remove a previously registered adapter class.
+
+    If C{adapterFactory} is L{None}, every adapter registered for
+    C{origInterface} and the given interface classes is removed.
+    Otherwise only the given adapter factory is removed.  When that factory
+    was the highest-priority registration (the one returned by lookups),
+    the next registered adapter becomes the result of subsequent lookups; if
+    no adapter remains, lookups return their default (L{None} by default).
+
+    After this call, new lookups can never return a removed adapter factory.
+    References to an adapter factory which were retrieved earlier remain
+    usable.
+
+    @return: C{True} if at least one registration was removed, C{False} if
+        nothing matched.
+    """
+    self = globalRegistry
+    assert interfaceClasses, "You need to pass an Interface"
+
+    # deal with class->interface adapters:
+    if not isinstance(origInterface, interface.InterfaceClass):
+        origInterface = declarations.implementedBy(origInterface)
+
+    chains, lock = _adapterPriorityState(self)
+    removed = False
     for interfaceClass in interfaceClasses:
-        self.register([origInterface], interfaceClass, "", adapterFactory)
+        key = (origInterface, interfaceClass)
+        with lock:
+            chain = chains.get(key)
+            if not chain:
+                continue
+
+            if adapterFactory is None:
+                self.unregister([origInterface], interfaceClass, "")
+                del chains[key]
+                removed = True
+            elif adapterFactory in chain:
+                wasTop = chain[0] is adapterFactory
+                chain.remove(adapterFactory)
+                if wasTop:
+                    if chain:
+                        self.register(
+                            [origInterface], interfaceClass, "", chain[0]
+                        )
+                    else:
+                        self.unregister([origInterface], interfaceClass, "")
+                        del chains[key]
+                removed = True
+    return removed
 
 
 def getAdapterFactory(fromInterface, toInterface, default):
@@ -74,6 +185,9 @@ def getAdapterFactory(fromInterface, toInterface, default):
 
     Note that is tied to the *Twisted* global registry, and will
     thus not find adapters registered elsewhere.
+
+    If no adapter matches, C{default} is returned explicitly (L{None} when
+    no other default is given); no exception is raised.
     """
     self = globalRegistry
     if not isinstance(fromInterface, interface.InterfaceClass):
@@ -420,6 +534,7 @@ class _ProxyDescriptor:
 
 __all__ = [
     "registerAdapter",
+    "unregisterAdapter",
     "getAdapterFactory",
     "Adapter",
     "Componentized",

@@ -128,15 +128,19 @@ class RebuildTests(TestCase):
 
         self.assertEqual(newComponent.__class__, crash_test_dummy.XA)
 
-        # Test that a duplicate registerAdapter is not allowed
+        # Re-registering the rebuilt adapter after the rebuild is an
+        # idempotent no-op: it does not raise and new lookups still find the
+        # rebuilt adapter.
         from twisted.python import components
 
-        self.assertRaises(
-            ValueError,
-            components.registerAdapter,
+        components.registerAdapter(
+            crash_test_dummy.XA, crash_test_dummy.X, crash_test_dummy.IX
+        )
+        self.assertIs(
+            components.getAdapterFactory(
+                crash_test_dummy.X, crash_test_dummy.IX, None
+            ),
             crash_test_dummy.XA,
-            crash_test_dummy.X,
-            crash_test_dummy.IX,
         )
 
     def test_UpdateInstance(self) -> None:

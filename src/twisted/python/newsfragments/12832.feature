@@ -1,0 +1,1 @@
+twisted.python.components now allows multiple adapters to be registered for the same interface pair with a stable, registration-order-based priority, and twisted.python.components.unregisterAdapter can remove them; removing the current adapter promotes the next one, and lookups which match nothing explicitly return the supplied default.
